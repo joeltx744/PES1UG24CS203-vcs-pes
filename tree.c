@@ -114,24 +114,94 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
     return 0;
 }
 
-// ─── TODO: Implement these ──────────────────────────────────────────────────
+// Forward declarations (implemented in object.c)
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
+int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out);
+int object_exists(const ObjectID *id);
+void object_path(const ObjectID *id, char *path_out, size_t path_size);
 
-// Build a tree hierarchy from the current index and write all tree
-// objects to the object store.
-//
-// HINTS - Useful functions and concepts for this phase:
-//   - index_load      : load the staged files into memory
-//   - strchr          : find the first '/' in a path to separate directories from files
-//   - strncmp         : compare prefixes to group files belonging to the same subdirectory
-//   - Recursion       : you will likely want to create a recursive helper function 
-//                       (e.g., `write_tree_level(entries, count, depth)`) to handle nested dirs.
-//   - tree_serialize  : convert your populated Tree struct into a binary buffer
-//   - object_write    : save that binary buffer to the store as OBJ_TREE
-//
-// Returns 0 on success, -1 on error.
+#include "index.h"
+
+// Recursive helper to build tree objects from a set of index entries.
+// 'index' is the full index.
+// 'start' and 'end' define the range of entries in the index to process for THIS tree level.
+// 'depth' is the number of characters of prefix to skip (e.g., if we are in "src/", depth=4).
+static int build_tree_recursive(const Index *index, int start, int end, int depth, ObjectID *id_out) {
+    Tree tree;
+    tree.count = 0;
+
+    for (int i = start; i < end; ) {
+        // Find the next path segment after 'depth'
+        const char *path = index->entries[i].path + depth;
+        const char *slash = strchr(path, '/');
+
+        if (slash == NULL) {
+            // It's a file in the current directory
+            if (tree.count >= MAX_TREE_ENTRIES) return -1;
+            TreeEntry *te = &tree.entries[tree.count++];
+            te->mode = index->entries[i].mode;
+            te->hash = index->entries[i].hash;
+            strncpy(te->name, path, sizeof(te->name));
+            i++;
+        } else {
+            // It's a subdirectory
+            if (tree.count >= MAX_TREE_ENTRIES) return -1;
+            TreeEntry *te = &tree.entries[tree.count++];
+            te->mode = MODE_DIR;
+            
+            size_t dir_name_len = slash - path;
+            if (dir_name_len >= sizeof(te->name)) return -1;
+            memcpy(te->name, path, dir_name_len);
+            te->name[dir_name_len] = '\0';
+
+            // Find all entries that belong to this subdirectory
+            int sub_start = i;
+            int sub_end = i;
+            while (sub_end < end) {
+                const char *p = index->entries[sub_end].path + depth;
+                if (strncmp(p, te->name, dir_name_len) == 0 && p[dir_name_len] == '/') {
+                    sub_end++;
+                } else {
+                    break;
+                }
+            }
+
+            // Recursively build the subtree
+            if (build_tree_recursive(index, sub_start, sub_end, depth + dir_name_len + 1, &te->hash) != 0)
+                return -1;
+
+            i = sub_end; // Skip processed entries
+        }
+    }
+
+    // Serialize and write the tree object
+    void *data;
+    size_t len;
+    if (tree_serialize(&tree, &data, &len) != 0) return -1;
+    if (object_write(OBJ_TREE, data, len, id_out) != 0) {
+        free(data);
+        return -1;
+    }
+    free(data);
+    return 0;
+}
+
+// Build a tree hierarchy from the current index.
+// Deduplication is automatic: unchanged subtrees produce the same hash and
+// are not re-written to the object store (object_write checks object_exists first).
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    Index index;
+    if (index_load(&index) != 0) return -1;
+    if (index.count == 0) {
+        // Empty tree
+        Tree tree;
+        tree.count = 0;
+        void *data;
+        size_t len;
+        tree_serialize(&tree, &data, &len);
+        object_write(OBJ_TREE, data, len, id_out);
+        free(data);
+        return 0;
+    }
+    return build_tree_recursive(&index, 0, index.count, 0, id_out);
 }
